@@ -280,15 +280,41 @@ func (m Model) renderTabsAndContent() string {
 		}{"Tenants", m.tenants.Count()})
 	}
 
-	var renderedTabs []string
+	// Calculate available width for tabs
+	availableWidth := m.width - 2 // Account for borders
+
+	// Calculate the natural width of each tab and total
+	tabLabels := make([]string, len(tabs))
+	naturalWidths := make([]int, len(tabs))
+	totalNaturalWidth := 0
 
 	for i, tab := range tabs {
+		tabLabels[i] = fmt.Sprintf(" %d %s (%d) ", i+1, tab.name, tab.count)
+		// Width includes border (2) and padding (2)
+		naturalWidths[i] = len(tabLabels[i]) + 4
+		totalNaturalWidth += naturalWidths[i]
+	}
+
+	// Calculate extra space to distribute to the last tab
+	extraSpace := availableWidth - totalNaturalWidth
+	if extraSpace < 0 {
+		extraSpace = 0
+	}
+
+	var renderedTabs []string
+
+	for i := range tabs {
 		var style lipgloss.Style
 		isFirst := i == 0
 		isLast := i == len(tabs)-1
 		isActive := i == m.activeTab
 
-		label := fmt.Sprintf(" %d %s (%d) ", i+1, tab.name, tab.count)
+		label := tabLabels[i]
+
+		// Add extra padding to the last tab to fill remaining space
+		if isLast && extraSpace > 0 {
+			label = label + strings.Repeat(" ", extraSpace)
+		}
 
 		if isActive {
 			style = ui.TabActiveStyle
@@ -327,10 +353,10 @@ func (m Model) renderTabsAndContent() string {
 		content = m.tenants.View()
 	}
 
-	// Create the window with content
-	windowWidth := lipgloss.Width(row) - ui.TabWindowStyle.GetHorizontalFrameSize()
+	// Create the window with content - use full width
+	windowWidth := m.width - 4 // Account for window borders
 	if windowWidth < 40 {
-		windowWidth = m.width - 4
+		windowWidth = 40
 	}
 
 	window := ui.TabWindowStyle.Width(windowWidth).Render(content)

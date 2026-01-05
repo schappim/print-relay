@@ -168,9 +168,13 @@ func (t *Table) View() string {
 
 	// Scroll indicator
 	if len(t.Rows) > t.Height {
+		scrollStr := formatScrollInfo(t.Offset, t.Height, len(t.Rows))
+		padding := totalWidth - 20
+		if padding < 0 {
+			padding = 0
+		}
 		scrollInfo := ui.MutedStyle.Render(
-			strings.Repeat(" ", totalWidth-20) +
-				formatScrollInfo(t.Offset, t.Height, len(t.Rows)),
+			strings.Repeat(" ", padding) + scrollStr,
 		)
 		sb.WriteString(scrollInfo)
 	}
