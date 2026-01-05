@@ -42,11 +42,24 @@ A cloud-based print relay system that enables remote printing to any printer con
 
 ### Prerequisites
 
-- Go 1.19 or later
+- Go 1.19 or later (if building from source)
 - macOS or Linux (for client with CUPS)
 - (Optional) Caddy or nginx for SSL termination
 
-### Build
+### Install via Homebrew (macOS)
+
+```bash
+# Add the tap
+brew tap schappim/printrelay
+
+# Install the server (for running on your cloud/server)
+brew install printrelay-server
+
+# Install the client (for machines with printers)
+brew install printrelay-client
+```
+
+### Build from Source
 
 ```bash
 # Clone the repository
