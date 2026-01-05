@@ -1,7 +1,7 @@
-.PHONY: build build-server build-client run-server run-client clean test fmt deps
+.PHONY: build build-server build-client build-admin run-server run-client clean test fmt deps
 
-# Build both binaries
-build: build-server build-client
+# Build all binaries
+build: build-server build-client build-admin
 
 # Build the server
 build-server:
@@ -10,6 +10,10 @@ build-server:
 # Build the client
 build-client:
 	go build -o bin/printrelay-client ./cmd/client
+
+# Build the admin TUI
+build-admin:
+	go build -o bin/printrelay-admin ./cmd/admin
 
 # Run the server (generates keys if not provided)
 run-server: build-server

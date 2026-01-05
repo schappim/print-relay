@@ -125,7 +125,7 @@ build_binaries() {
         "linux:arm"
     )
 
-    local components=("server" "client")
+    local components=("server" "client" "admin")
 
     for platform in "${platforms[@]}"; do
         IFS=':' read -r os arch <<< "$platform"
@@ -277,6 +277,7 @@ update_homebrew() {
 
     update_homebrew_formula "server"
     update_homebrew_formula "client"
+    update_homebrew_formula "admin"
 
     if [ "$DRY_RUN" = false ]; then
         cd "$HOMEBREW_PATH"
@@ -341,6 +342,8 @@ build_deb_package() {
     local description
     if [ "$component" = "server" ]; then
         description="Cloud print relay server - enables remote printing via REST API"
+    elif [ "$component" = "admin" ]; then
+        description="PrintRelay admin TUI - interactive terminal interface for server management"
     else
         description="Cloud print relay client - connects local printers to PrintRelay server"
     fi
@@ -375,6 +378,9 @@ build_deb_packages() {
     build_deb_package "client" "amd64" "amd64"
     build_deb_package "client" "arm64" "arm64"
     build_deb_package "client" "arm" "armhf"
+    build_deb_package "admin" "amd64" "amd64"
+    build_deb_package "admin" "arm64" "arm64"
+    build_deb_package "admin" "arm" "armhf"
 
     success "All .deb packages built"
 }
