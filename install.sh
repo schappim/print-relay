@@ -6,6 +6,7 @@
 #   curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash
 #   curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --client-only
 #   curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --server-only
+#   curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --admin-only
 #
 set -e
 
@@ -164,6 +165,11 @@ print_usage() {
         echo -e "    ${GREEN}printrelay-client -server \"wss://your-server.com/ws\" -key \"YOUR_CLIENT_KEY\"${NC}"
         echo ""
     fi
+    if [ "$install_admin" = true ]; then
+        echo "  Run the admin TUI:"
+        echo -e "    ${GREEN}printrelay-admin -server \"https://your-server.com\" -key \"YOUR_API_KEY\"${NC}"
+        echo ""
+    fi
     echo -e "  Documentation: ${BLUE}https://github.com/${REPO}${NC}"
     echo ""
 }
@@ -171,16 +177,29 @@ print_usage() {
 main() {
     local install_server=true
     local install_client=true
+    local install_admin=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             --server-only)
                 install_client=false
+                install_admin=false
                 shift
                 ;;
             --client-only)
                 install_server=false
+                install_admin=false
+                shift
+                ;;
+            --admin-only)
+                install_server=false
+                install_client=false
+                install_admin=true
+                shift
+                ;;
+            --with-admin)
+                install_admin=true
                 shift
                 ;;
             --version)
@@ -195,6 +214,8 @@ main() {
                 echo "Options:"
                 echo "  --server-only    Install only the server"
                 echo "  --client-only    Install only the client"
+                echo "  --admin-only     Install only the admin TUI"
+                echo "  --with-admin     Also install the admin TUI"
                 echo "  --version VER    Install specific version (default: $VERSION)"
                 echo "  --help, -h       Show this help message"
                 exit 0
@@ -239,6 +260,10 @@ main() {
 
     if [ "$install_client" = true ]; then
         download_and_install "client" "$os" "$arch"
+    fi
+
+    if [ "$install_admin" = true ]; then
+        download_and_install "admin" "$os" "$arch"
     fi
 
     echo ""

@@ -57,6 +57,9 @@ brew install printrelay-server
 
 # Install the client (for machines with printers)
 brew install printrelay-client
+
+# Install the admin TUI (for server administration)
+brew install printrelay-admin
 ```
 
 ### Install via Script (macOS & Linux)
@@ -70,6 +73,9 @@ curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh
 
 # Install only the server
 curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --server-only
+
+# Install only the admin TUI
+curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --admin-only
 ```
 
 ### Install via APT (Debian/Ubuntu)
@@ -83,7 +89,7 @@ echo "deb [signed-by=/usr/share/keyrings/printrelay.gpg] https://schappim.github
 
 # Update and install
 sudo apt update
-sudo apt install printrelay-server printrelay-client
+sudo apt install printrelay-server printrelay-client printrelay-admin
 ```
 
 ### Build from Source
@@ -98,6 +104,9 @@ go build -o printrelay-server ./cmd/server
 
 # Build client
 go build -o printrelay-client ./cmd/client
+
+# Build admin TUI
+go build -o printrelay-admin ./cmd/admin
 ```
 
 ---
@@ -508,6 +517,50 @@ curl -u "API_KEY:" https://your-server.com/printjobs \
 
 ---
 
+## Admin TUI
+
+PrintRelay includes an interactive terminal UI for server administration.
+
+### Running the Admin TUI
+
+```bash
+# Basic usage (view computers, printers, jobs)
+printrelay-admin -server https://your-server.com -key YOUR_API_KEY
+
+# With admin access (manage tenants)
+printrelay-admin -server https://your-server.com -key YOUR_API_KEY -admin-key YOUR_ADMIN_KEY
+
+# Using a config file
+printrelay-admin -config ~/.config/printrelay/admin.yaml
+```
+
+### Config File Format
+
+Create `~/.config/printrelay/admin.yaml`:
+
+```yaml
+server: https://your-server.com
+apiKey: your-api-key
+adminKey: your-admin-key  # Optional, for tenant management
+```
+
+### Keyboard Controls
+
+| Key | Action |
+|-----|--------|
+| `1/2/3/4` | Switch tabs (Computers/Printers/Jobs/Tenants) |
+| `j/k` or `↑/↓` | Navigate up/down |
+| `Tab` | Next tab |
+| `r` | Refresh current view |
+| `n` | New tenant (Tenants tab) |
+| `Enter` | View tenant details |
+| `d` | Delete (Jobs/Tenants) |
+| `a` | Add API key (tenant details) |
+| `c` | Rotate client key (tenant details) |
+| `q` | Quit |
+
+---
+
 ## Project Structure
 
 ```
@@ -515,7 +568,9 @@ print-relay/
 ├── cmd/
 │   ├── server/         # Server entry point
 │   │   └── main.go
-│   └── client/         # Client entry point
+│   ├── client/         # Client entry point
+│   │   └── main.go
+│   └── admin/          # Admin TUI entry point
 │       └── main.go
 ├── cloudserver/        # Server implementation
 │   ├── server.go       # HTTP/WebSocket handlers
@@ -523,6 +578,11 @@ print-relay/
 │   └── store.go        # Data persistence
 ├── client/             # Client implementation
 │   └── client.go       # CUPS printing, WebSocket client
+├── internal/admin/     # Admin TUI implementation
+│   ├── app.go          # Main Bubble Tea model
+│   ├── config.go       # Configuration
+│   ├── api/            # API client
+│   └── ui/             # UI components
 ├── protocol/           # Shared protocol definitions
 │   └── protocol.go     # Message types, constants
 ├── go.mod
