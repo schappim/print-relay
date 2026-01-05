@@ -2,6 +2,7 @@ package cloudserver
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -24,29 +25,33 @@ import (
 
 // Config holds server configuration
 type Config struct {
-	APIKeys   []string // API keys for HTTP API authentication
-	ClientKey string   // Key for client WebSocket authentication
-	DataDir   string
-	Verbose   bool
+	AdminKey       string   // Admin API key for tenant management
+	DefaultAPIKey  string   // Default API key (creates default tenant if set)
+	DefaultClientKey string // Default client key (creates default tenant if set)
+	DataDir        string
+	Verbose        bool
 }
 
 // Server represents the PrintRelay cloud server
 type Server struct {
-	config   Config
-	store    *Store
-	hub      *Hub
-	upgrader websocket.Upgrader
+	config     Config
+	store      *Store
+	hub        *Hub
+	monitorHub *MonitorHub
+	upgrader   websocket.Upgrader
 }
 
 // New creates a new PrintRelay cloud server
 func New(cfg Config) (*Server, error) {
-	store := NewStore(cfg.DataDir, cfg.ClientKey, cfg.APIKeys)
-	hub := NewHub(store)
+	store := NewStore(cfg.DataDir, cfg.AdminKey, cfg.DefaultAPIKey, cfg.DefaultClientKey)
+	monitorHub := NewMonitorHub()
+	hub := NewHub(store, monitorHub)
 
 	s := &Server{
-		config: cfg,
-		store:  store,
-		hub:    hub,
+		config:     cfg,
+		store:      store,
+		hub:        hub,
+		monitorHub: monitorHub,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -56,8 +61,9 @@ func New(cfg Config) (*Server, error) {
 		},
 	}
 
-	// Start the hub
+	// Start the hubs
 	go hub.Run()
+	go monitorHub.Run()
 
 	return s, nil
 }
@@ -73,11 +79,17 @@ func GenerateKey() string {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// WebSocket endpoint for clients (uses client key auth)
+	// WebSocket endpoint for clients (uses client key auth via protocol)
 	mux.HandleFunc("/ws", s.handleWebSocket)
+
+	// Monitor WebSocket endpoint (uses token in URL)
+	mux.HandleFunc("/monitor/", s.handleMonitorWebSocket)
 
 	// Health check (no auth)
 	mux.HandleFunc("/ping", s.handlePing)
+
+	// Admin API endpoints (require admin key)
+	mux.HandleFunc("/admin/", s.withAdminAuth(s.handleAdmin))
 
 	// API endpoints (require API key auth)
 	mux.HandleFunc("/", s.withAPIAuth(s.handleRoot))
@@ -131,13 +143,50 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 	})
 }
 
+// Context key for tenant
+type contextKey string
+
+const tenantContextKey contextKey = "tenant"
+
+// getTenantFromContext retrieves the tenant from request context
+func getTenantFromContext(r *http.Request) *protocol.Tenant {
+	if tenant, ok := r.Context().Value(tenantContextKey).(*protocol.Tenant); ok {
+		return tenant
+	}
+	return nil
+}
+
 // Middleware: API key authentication
 func (s *Server) withAPIAuth(handler func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, _, ok := r.BasicAuth()
-		if !ok || !s.store.ValidateAPIKey(user) {
+		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="PrintRelay API"`)
 			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid API key")
+			return
+		}
+
+		tenant, valid := s.store.ValidateAPIKey(user)
+		if !valid {
+			w.Header().Set("WWW-Authenticate", `Basic realm="PrintRelay API"`)
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid API key")
+			return
+		}
+
+		// Add tenant to context
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, tenantContextKey, tenant)
+		handler(w, r.WithContext(ctx))
+	}
+}
+
+// Middleware: Admin key authentication
+func (s *Server) withAdminAuth(handler func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, _, ok := r.BasicAuth()
+		if !ok || !s.store.ValidateAdminKey(user) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="PrintRelay Admin"`)
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid admin key")
 			return
 		}
 		handler(w, r)
@@ -234,6 +283,262 @@ func (s *Server) writePump(client *ClientConnection) {
 	}
 }
 
+// handleMonitorWebSocket handles WebSocket connections from monitors
+func (s *Server) handleMonitorWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Extract token from URL path: /monitor/{token}
+	path := strings.TrimPrefix(r.URL.Path, "/monitor/")
+	token := strings.TrimSuffix(path, "/")
+
+	if token == "" {
+		s.writeError(w, http.StatusBadRequest, "bad_request", "Monitor token required")
+		return
+	}
+
+	// Validate token
+	tenant, ok := s.store.ValidateMonitorToken(token)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid monitor token")
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[Monitor] Upgrade error: %v", err)
+		return
+	}
+
+	monitorID := GenerateKey()[:16]
+	monitor := &MonitorConnection{
+		ID:       monitorID,
+		TenantID: tenant.ID,
+		Conn:     conn,
+		Send:     make(chan []byte, 256),
+		Hub:      s.monitorHub,
+	}
+
+	s.monitorHub.register <- monitor
+
+	// Send welcome message
+	if err := s.monitorHub.SendWelcome(monitor, tenant); err != nil {
+		log.Printf("[Monitor] Failed to send welcome: %v", err)
+	}
+
+	// Start read and write pumps
+	go s.monitorWritePump(monitor)
+	go s.monitorReadPump(monitor)
+}
+
+// monitorReadPump reads messages from the monitor WebSocket (mainly for ping/pong)
+func (s *Server) monitorReadPump(monitor *MonitorConnection) {
+	defer func() {
+		s.monitorHub.unregister <- monitor
+		monitor.Conn.Close()
+	}()
+
+	monitor.Conn.SetReadLimit(1024) // Small limit - monitors don't send much
+	monitor.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	monitor.Conn.SetPongHandler(func(string) error {
+		monitor.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, _, err := monitor.Conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("[Monitor] Read error from %s: %v", monitor.ID, err)
+			}
+			break
+		}
+	}
+}
+
+// monitorWritePump writes messages to the monitor WebSocket
+func (s *Server) monitorWritePump(monitor *MonitorConnection) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer func() {
+		ticker.Stop()
+		monitor.Conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-monitor.Send:
+			monitor.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				monitor.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			if err := monitor.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("[Monitor] Write error to %s: %v", monitor.ID, err)
+				return
+			}
+
+		case <-ticker.C:
+			monitor.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := monitor.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// handleAdmin routes admin API requests
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/admin")
+
+	switch {
+	case path == "/tenants" || path == "/tenants/":
+		s.handleAdminTenants(w, r)
+	case strings.HasPrefix(path, "/tenants/"):
+		s.handleAdminTenantByID(w, r)
+	default:
+		s.writeError(w, http.StatusNotFound, "not_found", "Admin endpoint not found")
+	}
+}
+
+// handleAdminTenants handles /admin/tenants
+func (s *Server) handleAdminTenants(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		tenants := s.store.GetTenants()
+		s.writeJSON(w, http.StatusOK, tenants)
+
+	case http.MethodPost:
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.writeError(w, http.StatusBadRequest, "bad_request", "Invalid JSON")
+			return
+		}
+		if req.Name == "" {
+			s.writeError(w, http.StatusBadRequest, "bad_request", "Name is required")
+			return
+		}
+
+		tenant := s.store.CreateTenant(req.Name)
+		s.writeJSON(w, http.StatusCreated, tenant)
+
+	default:
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+	}
+}
+
+// handleAdminTenantByID handles /admin/tenants/{id}/*
+func (s *Server) handleAdminTenantByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/admin/tenants/")
+	parts := strings.SplitN(path, "/", 2)
+	tenantID := parts[0]
+
+	if tenantID == "" {
+		s.writeError(w, http.StatusBadRequest, "bad_request", "Tenant ID required")
+		return
+	}
+
+	tenant := s.store.GetTenant(tenantID)
+	if tenant == nil {
+		s.writeError(w, http.StatusNotFound, "not_found", "Tenant not found")
+		return
+	}
+
+	// Check for sub-path
+	if len(parts) > 1 {
+		subPath := parts[1]
+		switch {
+		case subPath == "apikeys" || subPath == "apikeys/":
+			s.handleTenantAPIKeys(w, r, tenant)
+		case subPath == "rotate-monitor-token":
+			s.handleRotateMonitorToken(w, r, tenant)
+		case subPath == "rotate-client-key":
+			s.handleRotateClientKey(w, r, tenant)
+		default:
+			s.writeError(w, http.StatusNotFound, "not_found", "Endpoint not found")
+		}
+		return
+	}
+
+	// Handle tenant itself
+	switch r.Method {
+	case http.MethodGet:
+		s.writeJSON(w, http.StatusOK, tenant)
+
+	case http.MethodDelete:
+		if s.store.DeleteTenant(tenantID) {
+			s.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		} else {
+			s.writeError(w, http.StatusInternalServerError, "delete_failed", "Failed to delete tenant")
+		}
+
+	default:
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+	}
+}
+
+// handleTenantAPIKeys handles /admin/tenants/{id}/apikeys
+func (s *Server) handleTenantAPIKeys(w http.ResponseWriter, r *http.Request, tenant *protocol.Tenant) {
+	switch r.Method {
+	case http.MethodGet:
+		s.writeJSON(w, http.StatusOK, tenant.APIKeys)
+
+	case http.MethodPost:
+		key := s.store.AddAPIKey(tenant.ID)
+		if key == "" {
+			s.writeError(w, http.StatusInternalServerError, "add_failed", "Failed to add API key")
+			return
+		}
+		s.writeJSON(w, http.StatusCreated, map[string]string{"apiKey": key})
+
+	case http.MethodDelete:
+		var req struct {
+			APIKey string `json:"apiKey"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.writeError(w, http.StatusBadRequest, "bad_request", "Invalid JSON")
+			return
+		}
+		if s.store.RevokeAPIKey(tenant.ID, req.APIKey) {
+			s.writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+		} else {
+			s.writeError(w, http.StatusNotFound, "not_found", "API key not found")
+		}
+
+	default:
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+	}
+}
+
+// handleRotateMonitorToken handles /admin/tenants/{id}/rotate-monitor-token
+func (s *Server) handleRotateMonitorToken(w http.ResponseWriter, r *http.Request, tenant *protocol.Tenant) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+		return
+	}
+
+	newToken := s.store.RotateMonitorToken(tenant.ID)
+	if newToken == "" {
+		s.writeError(w, http.StatusInternalServerError, "rotate_failed", "Failed to rotate token")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"monitorToken": newToken})
+}
+
+// handleRotateClientKey handles /admin/tenants/{id}/rotate-client-key
+func (s *Server) handleRotateClientKey(w http.ResponseWriter, r *http.Request, tenant *protocol.Tenant) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+		return
+	}
+
+	newKey := s.store.RotateClientKey(tenant.ID)
+	if newKey == "" {
+		s.writeError(w, http.StatusInternalServerError, "rotate_failed", "Failed to rotate client key")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]string{"clientKey": newKey})
+}
+
 // handleRoot routes API requests
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -285,17 +590,28 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		return
 	}
-	account := s.store.GetAccount(s.hub.GetConnectedComputers())
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+	account := s.store.GetAccount(tenant.ID, s.hub.GetConnectedComputers(tenant.ID))
 	s.writeJSON(w, http.StatusOK, account)
 }
 
 func (s *Server) handleComputers(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		computers := s.store.GetComputers()
+		computers := s.store.GetComputers(tenant.ID)
 		// Update connection status
 		for _, c := range computers {
-			if s.hub.IsComputerConnected(c.ID) {
+			if s.hub.IsComputerConnected(tenant.ID, c.ID) {
 				c.State = protocol.ComputerStateConnected
 			} else {
 				c.State = protocol.ComputerStateDisconnected
@@ -304,10 +620,10 @@ func (s *Server) handleComputers(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, computers)
 
 	case http.MethodDelete:
-		computers := s.store.GetComputers()
+		computers := s.store.GetComputers(tenant.ID)
 		deleted := make([]int64, 0)
 		for _, c := range computers {
-			if s.store.DeleteComputer(c.ID) {
+			if s.store.DeleteComputer(tenant.ID, c.ID) {
 				deleted = append(deleted, c.ID)
 			}
 		}
@@ -319,6 +635,12 @@ func (s *Server) handleComputers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleComputersWithID(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/computers/")
 	parts := strings.Split(path, "/")
 
@@ -330,7 +652,7 @@ func (s *Server) handleComputersWithID(w http.ResponseWriter, r *http.Request) {
 
 	// Handle /computers/{id}/printers
 	if len(parts) >= 2 && parts[1] == "printers" {
-		s.handleComputerPrinters(w, r, ids)
+		s.handleComputerPrinters(w, r, tenant.ID, ids)
 		return
 	}
 
@@ -338,8 +660,8 @@ func (s *Server) handleComputersWithID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		computers := make([]*protocol.Computer, 0)
 		for _, id := range ids {
-			if c := s.store.GetComputer(id); c != nil {
-				if s.hub.IsComputerConnected(c.ID) {
+			if c := s.store.GetComputer(tenant.ID, id); c != nil {
+				if s.hub.IsComputerConnected(tenant.ID, c.ID) {
 					c.State = protocol.ComputerStateConnected
 				}
 				computers = append(computers, c)
@@ -350,7 +672,7 @@ func (s *Server) handleComputersWithID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		deleted := make([]int64, 0)
 		for _, id := range ids {
-			if s.store.DeleteComputer(id) {
+			if s.store.DeleteComputer(tenant.ID, id) {
 				deleted = append(deleted, id)
 			}
 		}
@@ -361,7 +683,7 @@ func (s *Server) handleComputersWithID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleComputerPrinters(w http.ResponseWriter, r *http.Request, computerIDs []int64) {
+func (s *Server) handleComputerPrinters(w http.ResponseWriter, r *http.Request, tenantID string, computerIDs []int64) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		return
@@ -369,21 +691,33 @@ func (s *Server) handleComputerPrinters(w http.ResponseWriter, r *http.Request, 
 
 	printers := make([]*protocol.Printer, 0)
 	for _, cid := range computerIDs {
-		printers = append(printers, s.store.GetPrintersForComputer(cid)...)
+		printers = append(printers, s.store.GetPrintersForComputer(tenantID, cid)...)
 	}
 	s.writeJSON(w, http.StatusOK, printers)
 }
 
 func (s *Server) handlePrinters(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		return
 	}
-	printers := s.store.GetPrinters()
+	printers := s.store.GetPrinters(tenant.ID)
 	s.writeJSON(w, http.StatusOK, printers)
 }
 
 func (s *Server) handlePrintersWithID(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/printers/")
 	parts := strings.Split(path, "/")
 
@@ -395,7 +729,7 @@ func (s *Server) handlePrintersWithID(w http.ResponseWriter, r *http.Request) {
 
 	// Handle /printers/{id}/printjobs
 	if len(parts) >= 2 && parts[1] == "printjobs" {
-		s.handlePrinterPrintJobs(w, r, ids)
+		s.handlePrinterPrintJobs(w, r, tenant.ID, ids)
 		return
 	}
 
@@ -406,14 +740,14 @@ func (s *Server) handlePrintersWithID(w http.ResponseWriter, r *http.Request) {
 
 	printers := make([]*protocol.Printer, 0)
 	for _, id := range ids {
-		if p := s.store.GetPrinter(id); p != nil {
+		if p := s.store.GetPrinter(tenant.ID, id); p != nil {
 			printers = append(printers, p)
 		}
 	}
 	s.writeJSON(w, http.StatusOK, printers)
 }
 
-func (s *Server) handlePrinterPrintJobs(w http.ResponseWriter, r *http.Request, printerIDs []int64) {
+func (s *Server) handlePrinterPrintJobs(w http.ResponseWriter, r *http.Request, tenantID string, printerIDs []int64) {
 	if r.Method != http.MethodGet {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 		return
@@ -421,25 +755,31 @@ func (s *Server) handlePrinterPrintJobs(w http.ResponseWriter, r *http.Request, 
 
 	jobs := make([]*PrintJob, 0)
 	for _, pid := range printerIDs {
-		jobs = append(jobs, s.store.GetPrintJobsForPrinter(pid)...)
+		jobs = append(jobs, s.store.GetPrintJobsForPrinter(tenantID, pid)...)
 	}
 	s.writeJSON(w, http.StatusOK, jobs)
 }
 
 func (s *Server) handlePrintJobs(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		jobs := s.store.GetPrintJobs()
+		jobs := s.store.GetPrintJobs(tenant.ID)
 		s.writeJSON(w, http.StatusOK, jobs)
 
 	case http.MethodPost:
 		s.handleCreatePrintJob(w, r)
 
 	case http.MethodDelete:
-		jobs := s.store.GetPrintJobs()
+		jobs := s.store.GetPrintJobs(tenant.ID)
 		deleted := make([]int64, 0)
 		for _, j := range jobs {
-			if s.store.DeletePrintJob(j.ID) {
+			if s.store.DeletePrintJob(tenant.ID, j.ID) {
 				deleted = append(deleted, j.ID)
 			}
 		}
@@ -451,6 +791,12 @@ func (s *Server) handlePrintJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePrintJobsWithID(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/printjobs/")
 
 	if path == "states" {
@@ -468,7 +814,7 @@ func (s *Server) handlePrintJobsWithID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		jobs := make([]*PrintJob, 0)
 		for _, id := range ids {
-			if j := s.store.GetPrintJob(id); j != nil {
+			if j := s.store.GetPrintJob(tenant.ID, id); j != nil {
 				jobs = append(jobs, j)
 			}
 		}
@@ -477,7 +823,7 @@ func (s *Server) handlePrintJobsWithID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		deleted := make([]int64, 0)
 		for _, id := range ids {
-			if s.store.DeletePrintJob(id) {
+			if s.store.DeletePrintJob(tenant.ID, id) {
 				deleted = append(deleted, id)
 			}
 		}
@@ -520,6 +866,12 @@ type PrintJobCreateRequest struct {
 }
 
 func (s *Server) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
+	tenant := getTenantFromContext(r)
+	if tenant == nil {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "No tenant context")
+		return
+	}
+
 	var req PrintJobCreateRequest
 
 	contentType := r.Header.Get("Content-Type")
@@ -567,22 +919,27 @@ func (s *Server) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check printer exists
-	printer := s.store.GetPrinter(req.PrinterID)
+	printer := s.store.GetPrinter(tenant.ID, req.PrinterID)
 	if printer == nil {
 		s.writeError(w, http.StatusBadRequest, "bad_request", "Printer not found")
 		return
 	}
 
 	// Create job in store
-	job, err := s.store.CreatePrintJob(req.PrinterID, req.Title, req.ContentType, req.Content, req.Source, req.Options, req.Qty)
+	job, err := s.store.CreatePrintJob(tenant.ID, req.PrinterID, req.Title, req.ContentType, req.Content, req.Source, req.Options, req.Qty)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
+	// Emit job created event
+	if s.monitorHub != nil {
+		s.monitorHub.EmitJobCreated(tenant.ID, job, printer.Name)
+	}
+
 	// Handle virtual printer (save to disk)
-	if s.store.IsVirtualPrinter(req.PrinterID) {
-		go s.processVirtualPrintJob(job, &req)
+	if s.store.IsVirtualPrinter(tenant.ID, req.PrinterID) {
+		go s.processVirtualPrintJob(tenant.ID, job, &req)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		fmt.Fprintf(w, "%d", job.ID)
@@ -590,8 +947,8 @@ func (s *Server) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check computer is connected (only for real printers)
-	if !s.hub.IsComputerConnected(printer.ComputerID) {
-		s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+	if !s.hub.IsComputerConnected(tenant.ID, printer.ComputerID) {
+		s.store.UpdatePrintJobStatus(tenant.ID, protocol.PrintJobStatus{
 			JobID:     job.ID,
 			State:     protocol.StateError,
 			Message:   "Computer is not connected",
@@ -614,9 +971,9 @@ func (s *Server) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
 		Qty:         req.Qty,
 	}
 
-	if err := s.hub.SendPrintJob(jobReq, req.PrinterID); err != nil {
+	if err := s.hub.SendPrintJob(tenant.ID, jobReq, req.PrinterID); err != nil {
 		// Update job state to error
-		s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+		s.store.UpdatePrintJobStatus(tenant.ID, protocol.PrintJobStatus{
 			JobID:     job.ID,
 			State:     protocol.StateError,
 			Message:   fmt.Sprintf("Failed to send to client: %v", err),
@@ -627,7 +984,7 @@ func (s *Server) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update state to sent
-	s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+	s.store.UpdatePrintJobStatus(tenant.ID, protocol.PrintJobStatus{
 		JobID:     job.ID,
 		State:     protocol.StateSent,
 		Message:   "Sent to client",
@@ -691,9 +1048,9 @@ func parseSetRange(s string) ([]int64, error) {
 }
 
 // processVirtualPrintJob handles print jobs for the virtual PDF printer
-func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateRequest) {
+func (s *Server) processVirtualPrintJob(tenantID string, job *PrintJob, req *PrintJobCreateRequest) {
 	// Update status
-	s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+	s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 		JobID:     job.ID,
 		State:     protocol.StateReceived,
 		Message:   "Processing on virtual printer",
@@ -715,7 +1072,7 @@ func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateReques
 
 	if err != nil {
 		log.Printf("[VirtualPrinter] Failed to decode content for job %d: %v", job.ID, err)
-		s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+		s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 			JobID:     job.ID,
 			State:     protocol.StateError,
 			Message:   fmt.Sprintf("Failed to decode content: %v", err),
@@ -728,7 +1085,7 @@ func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateReques
 	outputDir := s.store.GetPDFOutputDir()
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		log.Printf("[VirtualPrinter] Failed to create output dir: %v", err)
-		s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+		s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 			JobID:     job.ID,
 			State:     protocol.StateError,
 			Message:   fmt.Sprintf("Failed to create output directory: %v", err),
@@ -748,7 +1105,7 @@ func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateReques
 	filepath := filepath.Join(outputDir, filename)
 
 	// Update status
-	s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+	s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 		JobID:     job.ID,
 		State:     protocol.StatePrinting,
 		Message:   "Saving to disk",
@@ -758,7 +1115,7 @@ func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateReques
 	// Write file
 	if err := os.WriteFile(filepath, content, 0644); err != nil {
 		log.Printf("[VirtualPrinter] Failed to write file for job %d: %v", job.ID, err)
-		s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+		s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 			JobID:     job.ID,
 			State:     protocol.StateError,
 			Message:   fmt.Sprintf("Failed to save file: %v", err),
@@ -770,7 +1127,7 @@ func (s *Server) processVirtualPrintJob(job *PrintJob, req *PrintJobCreateReques
 	log.Printf("[VirtualPrinter] Job %d saved to: %s (%d bytes)", job.ID, filepath, len(content))
 
 	// Update status to done
-	s.store.UpdatePrintJobStatus(protocol.PrintJobStatus{
+	s.store.UpdatePrintJobStatus(tenantID, protocol.PrintJobStatus{
 		JobID:     job.ID,
 		State:     protocol.StateDone,
 		Message:   fmt.Sprintf("Saved to %s", filepath),

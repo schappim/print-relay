@@ -10,7 +10,7 @@
 set -e
 
 REPO="schappim/print-relay"
-VERSION="1.0.0"
+VERSION="1.1.0"
 INSTALL_DIR="/usr/local/bin"
 SUDO=""
 
@@ -82,9 +82,10 @@ detect_os() {
 
 detect_arch() {
     case "$(uname -m)" in
-        x86_64|amd64)  echo "amd64";;
-        arm64|aarch64) echo "arm64";;
-        *)             echo "unsupported";;
+        x86_64|amd64)      echo "amd64";;
+        arm64|aarch64)     echo "arm64";;
+        armv7l|armv6l|arm) echo "arm";;
+        *)                 echo "unsupported";;
     esac
 }
 

@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"printrelay/cloudserver"
 )
@@ -13,8 +12,9 @@ import (
 func main() {
 	// CLI flags
 	port := flag.String("port", "8080", "Port to listen on")
-	apiKey := flag.String("api-key", "", "API key for HTTP API authentication (can specify multiple comma-separated)")
-	clientKey := flag.String("client-key", "", "Key for client WebSocket authentication")
+	adminKey := flag.String("admin-key", "", "Admin key for tenant management API")
+	apiKey := flag.String("api-key", "", "Default API key (creates default tenant)")
+	clientKey := flag.String("client-key", "", "Default client key (creates default tenant)")
 	dataDir := flag.String("data-dir", "./data", "Directory for persistent data storage")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
@@ -23,16 +23,16 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// Generate keys if not provided
-	apiKeys := []string{}
-	if *apiKey == "" {
-		key := cloudserver.GenerateKey()
-		apiKeys = append(apiKeys, key)
-		log.Printf("Generated API Key: %s", key)
-	} else {
-		apiKeys = strings.Split(*apiKey, ",")
-		for i, k := range apiKeys {
-			apiKeys[i] = strings.TrimSpace(k)
-		}
+	adminKeyVal := *adminKey
+	if adminKeyVal == "" {
+		adminKeyVal = cloudserver.GenerateKey()
+		log.Printf("Generated Admin Key: %s", adminKeyVal)
+	}
+
+	apiKeyVal := *apiKey
+	if apiKeyVal == "" {
+		apiKeyVal = cloudserver.GenerateKey()
+		log.Printf("Generated API Key: %s", apiKeyVal)
 	}
 
 	clientKeyVal := *clientKey
@@ -42,8 +42,9 @@ func main() {
 	}
 
 	log.Println("--------------------------------------")
-	log.Println("Use API Key for HTTP API authentication (Basic Auth with key as username)")
-	log.Println("Use Client Key when starting PrintRelay clients")
+	log.Println("Admin Key: For tenant management (/admin/* endpoints)")
+	log.Println("API Key: For HTTP API authentication (Basic Auth with key as username)")
+	log.Println("Client Key: For PrintRelay client connections")
 	log.Println("--------------------------------------")
 
 	// Ensure data directory exists
@@ -53,10 +54,11 @@ func main() {
 
 	// Create and configure server
 	srv, err := cloudserver.New(cloudserver.Config{
-		APIKeys:   apiKeys,
-		ClientKey: clientKeyVal,
-		DataDir:   *dataDir,
-		Verbose:   *verbose,
+		AdminKey:         adminKeyVal,
+		DefaultAPIKey:    apiKeyVal,
+		DefaultClientKey: clientKeyVal,
+		DataDir:          *dataDir,
+		Verbose:          *verbose,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
@@ -66,6 +68,7 @@ func main() {
 	addr := ":" + *port
 	log.Printf("PrintRelay server starting on http://localhost%s", addr)
 	log.Printf("WebSocket endpoint: ws://localhost%s/ws", addr)
+	log.Printf("Monitor endpoint: ws://localhost%s/monitor/{token}", addr)
 
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatalf("Server failed: %v", err)

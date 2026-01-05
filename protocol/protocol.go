@@ -23,6 +23,14 @@ const (
 	MsgTypePrintJobCancel    = "printjob_cancel"    // Cancel a print job
 	MsgTypeRefreshPrinters   = "refresh_printers"   // Request printer refresh
 	MsgTypeServerError       = "server_error"       // Error message
+
+	// Monitor WebSocket messages (Server -> Monitor)
+	MsgTypeMonitorWelcome        = "welcome"             // Connection acknowledged
+	MsgTypeMonitorHeartbeat      = "heartbeat"           // Keep-alive
+	MsgTypeJobCreated            = "job_created"         // New job created
+	MsgTypeJobStateChanged       = "job_state_changed"   // Job state changed
+	MsgTypePrinterConnected      = "printer_connected"   // Printer client connected
+	MsgTypePrinterDisconnected   = "printer_disconnected" // Printer client disconnected
 )
 
 // Message is the envelope for all WebSocket messages
@@ -225,4 +233,67 @@ const (
 const (
 	PrinterStateOnline  = "online"
 	PrinterStateOffline = "offline"
+)
+
+// Tenant represents a multi-tenant account
+type Tenant struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	APIKeys      []string  `json:"apiKeys"`      // Keys for REST API authentication
+	ClientKey    string    `json:"clientKey"`    // Key for printer client WebSocket auth
+	MonitorToken string    `json:"monitorToken"` // Token for monitor WebSocket URL
+	CreatedAt    time.Time `json:"createdAt"`
+	State        string    `json:"state"`        // active, suspended
+}
+
+// MonitorWelcome is sent when a monitor connects
+type MonitorWelcome struct {
+	TenantID   string    `json:"tenantId"`
+	TenantName string    `json:"tenantName"`
+	ServerTime time.Time `json:"serverTime"`
+}
+
+// MonitorEvent is the base for all monitor events
+type MonitorEvent struct {
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Data      any       `json:"data"`
+}
+
+// JobCreatedEvent is sent when a new job is created
+type JobCreatedEvent struct {
+	ID          int64  `json:"id"`
+	PrinterID   int64  `json:"printerId"`
+	PrinterName string `json:"printerName"`
+	Title       string `json:"title"`
+	State       string `json:"state"`
+	Source      string `json:"source"`
+}
+
+// JobStateChangedEvent is sent when job state changes
+type JobStateChangedEvent struct {
+	ID            int64  `json:"id"`
+	PrinterID     int64  `json:"printerId"`
+	PreviousState string `json:"previousState"`
+	State         string `json:"state"`
+	Message       string `json:"message"`
+}
+
+// PrinterConnectedEvent is sent when a printer client connects
+type PrinterConnectedEvent struct {
+	ComputerID   int64     `json:"computerId"`
+	ComputerName string    `json:"computerName"`
+	Printers     []Printer `json:"printers"`
+}
+
+// PrinterDisconnectedEvent is sent when a printer client disconnects
+type PrinterDisconnectedEvent struct {
+	ComputerID   int64  `json:"computerId"`
+	ComputerName string `json:"computerName"`
+}
+
+// Tenant states
+const (
+	TenantStateActive    = "active"
+	TenantStateSuspended = "suspended"
 )

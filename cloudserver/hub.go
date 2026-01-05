@@ -13,6 +13,7 @@ import (
 // ClientConnection represents a connected client
 type ClientConnection struct {
 	ID         string
+	TenantID   string
 	ComputerID int64
 	Conn       *websocket.Conn
 	Send       chan []byte
@@ -26,8 +27,8 @@ type Hub struct {
 	// Registered clients by client ID
 	clients map[string]*ClientConnection
 
-	// Map computer ID to client connection
-	computerToClient map[int64]*ClientConnection
+	// Map tenant ID -> computer ID -> client connection
+	tenantComputerToClient map[string]map[int64]*ClientConnection
 
 	// Inbound messages from clients
 	incoming chan *ClientMessage
@@ -41,6 +42,9 @@ type Hub struct {
 	// Reference to the store
 	store *Store
 
+	// Reference to the monitor hub for emitting events
+	monitorHub *MonitorHub
+
 	mu sync.RWMutex
 }
 
@@ -51,14 +55,15 @@ type ClientMessage struct {
 }
 
 // NewHub creates a new Hub
-func NewHub(store *Store) *Hub {
+func NewHub(store *Store, monitorHub *MonitorHub) *Hub {
 	return &Hub{
-		clients:          make(map[string]*ClientConnection),
-		computerToClient: make(map[int64]*ClientConnection),
-		incoming:         make(chan *ClientMessage, 256),
-		register:         make(chan *ClientConnection),
-		unregister:       make(chan *ClientConnection),
-		store:            store,
+		clients:                make(map[string]*ClientConnection),
+		tenantComputerToClient: make(map[string]map[int64]*ClientConnection),
+		incoming:               make(chan *ClientMessage, 256),
+		register:               make(chan *ClientConnection),
+		unregister:             make(chan *ClientConnection),
+		store:                  store,
+		monitorHub:             monitorHub,
 	}
 }
 
@@ -69,20 +74,33 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client.ID] = client
-			if client.ComputerID > 0 {
-				h.computerToClient[client.ComputerID] = client
+			if client.TenantID != "" && client.ComputerID > 0 {
+				if h.tenantComputerToClient[client.TenantID] == nil {
+					h.tenantComputerToClient[client.TenantID] = make(map[int64]*ClientConnection)
+				}
+				h.tenantComputerToClient[client.TenantID][client.ComputerID] = client
 			}
 			h.mu.Unlock()
-			log.Printf("[Hub] Client registered: %s (computer: %d)", client.ID, client.ComputerID)
+			log.Printf("[Hub] Client registered: %s (tenant: %s, computer: %d)", client.ID, client.TenantID, client.ComputerID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client.ID]; ok {
 				delete(h.clients, client.ID)
-				if client.ComputerID > 0 {
-					delete(h.computerToClient, client.ComputerID)
+				if client.TenantID != "" && client.ComputerID > 0 {
+					if h.tenantComputerToClient[client.TenantID] != nil {
+						delete(h.tenantComputerToClient[client.TenantID], client.ComputerID)
+					}
 					// Update computer state to disconnected
-					h.store.SetComputerState(client.ComputerID, protocol.ComputerStateDisconnected)
+					h.store.SetComputerState(client.TenantID, client.ComputerID, protocol.ComputerStateDisconnected)
+
+					// Emit printer disconnected event
+					if h.monitorHub != nil {
+						computer := h.store.GetComputer(client.TenantID, client.ComputerID)
+						if computer != nil {
+							h.monitorHub.EmitPrinterDisconnected(client.TenantID, computer)
+						}
+					}
 				}
 				close(client.Send)
 			}
@@ -127,26 +145,33 @@ func (h *Hub) handleClientHello(cm *ClientMessage) {
 		return
 	}
 
-	// Verify client key
-	if !h.store.ValidateClientKey(hello.ClientKey) {
+	// Verify client key and get tenant
+	tenant, ok := h.store.ValidateClientKey(hello.ClientKey)
+	if !ok {
 		log.Printf("[Hub] Invalid client key from %s", cm.Client.ID)
 		h.sendError(cm.Client, "unauthorized", "Invalid client key")
 		return
 	}
 
-	// Register or update computer
-	computer := h.store.RegisterComputer(hello)
+	// Set tenant ID on client
+	cm.Client.TenantID = tenant.ID
+
+	// Register or update computer for this tenant
+	computer := h.store.RegisterComputer(tenant.ID, hello)
 	cm.Client.ComputerID = computer.ID
 
 	// Update the hub's computer mapping
 	h.mu.Lock()
-	h.computerToClient[computer.ID] = cm.Client
+	if h.tenantComputerToClient[tenant.ID] == nil {
+		h.tenantComputerToClient[tenant.ID] = make(map[int64]*ClientConnection)
+	}
+	h.tenantComputerToClient[tenant.ID][computer.ID] = cm.Client
 	h.mu.Unlock()
 
-	// Register printers
+	// Register printers for this tenant
 	for _, p := range hello.Printers {
 		p.ComputerID = computer.ID
-		h.store.RegisterPrinter(p)
+		h.store.RegisterPrinter(tenant.ID, p)
 	}
 
 	// Send response
@@ -158,7 +183,12 @@ func (h *Hub) handleClientHello(cm *ClientMessage) {
 	}
 
 	h.sendMessage(cm.Client, protocol.MsgTypeServerHello, response)
-	log.Printf("[Hub] Computer registered: %s (ID: %d) with %d printers", hello.Hostname, computer.ID, len(hello.Printers))
+	log.Printf("[Hub] Computer registered: %s (ID: %d, Tenant: %s) with %d printers", hello.Hostname, computer.ID, tenant.ID, len(hello.Printers))
+
+	// Emit printer connected event
+	if h.monitorHub != nil {
+		h.monitorHub.EmitPrinterConnected(tenant.ID, computer, hello.Printers)
+	}
 }
 
 // handleHeartbeat responds to client heartbeats
@@ -170,43 +200,70 @@ func (h *Hub) handleHeartbeat(cm *ClientMessage) {
 
 // handlePrinterUpdate processes printer list updates
 func (h *Hub) handlePrinterUpdate(cm *ClientMessage) {
+	if cm.Client.TenantID == "" {
+		log.Printf("[Hub] PrinterUpdate from unauthenticated client %s", cm.Client.ID)
+		return
+	}
+
 	var update protocol.PrinterUpdate
 	if err := cm.Message.ParsePayload(&update); err != nil {
 		log.Printf("[Hub] Failed to parse PrinterUpdate: %v", err)
 		return
 	}
 
-	// Update printers in store
-	h.store.UpdatePrinters(update.ComputerID, update.Printers)
-	log.Printf("[Hub] Printer update from computer %d: %d printers", update.ComputerID, len(update.Printers))
+	// Update printers in store (tenant-scoped)
+	h.store.UpdatePrinters(cm.Client.TenantID, update.ComputerID, update.Printers)
+	log.Printf("[Hub] Printer update from computer %d (tenant %s): %d printers", update.ComputerID, cm.Client.TenantID, len(update.Printers))
 }
 
 // handlePrintJobStatus processes job status updates
 func (h *Hub) handlePrintJobStatus(cm *ClientMessage) {
+	if cm.Client.TenantID == "" {
+		log.Printf("[Hub] PrintJobStatus from unauthenticated client %s", cm.Client.ID)
+		return
+	}
+
 	var status protocol.PrintJobStatus
 	if err := cm.Message.ParsePayload(&status); err != nil {
 		log.Printf("[Hub] Failed to parse PrintJobStatus: %v", err)
 		return
 	}
 
-	h.store.UpdatePrintJobStatus(status)
-	log.Printf("[Hub] Job %d status: %s - %s", status.JobID, status.State, status.Message)
+	// Get the job to find its previous state and printer ID
+	job := h.store.GetPrintJob(cm.Client.TenantID, status.JobID)
+	previousState := ""
+	printerID := int64(0)
+	if job != nil {
+		previousState = job.State
+		printerID = job.PrinterID
+	}
+
+	h.store.UpdatePrintJobStatus(cm.Client.TenantID, status)
+	log.Printf("[Hub] Job %d status: %s - %s (tenant %s)", status.JobID, status.State, status.Message, cm.Client.TenantID)
+
+	// Emit job state changed event
+	if h.monitorHub != nil && previousState != status.State {
+		h.monitorHub.EmitJobStateChanged(cm.Client.TenantID, status.JobID, printerID, previousState, status.State, status.Message)
+	}
 }
 
 // SendPrintJob sends a print job to the appropriate client
-func (h *Hub) SendPrintJob(job *protocol.PrintJobRequest, printerID int64) error {
+func (h *Hub) SendPrintJob(tenantID string, job *protocol.PrintJobRequest, printerID int64) error {
 	// Find which computer has this printer
-	printer := h.store.GetPrinter(printerID)
+	printer := h.store.GetPrinter(tenantID, printerID)
 	if printer == nil {
 		return &Error{Code: "printer_not_found", Message: "Printer not found"}
 	}
 
 	// Find connected client for this computer
 	h.mu.RLock()
-	client, ok := h.computerToClient[printer.ComputerID]
+	var client *ClientConnection
+	if tenantClients, ok := h.tenantComputerToClient[tenantID]; ok {
+		client = tenantClients[printer.ComputerID]
+	}
 	h.mu.RUnlock()
 
-	if !ok || client == nil {
+	if client == nil {
 		return &Error{Code: "computer_offline", Message: "Computer is not connected"}
 	}
 
@@ -218,12 +275,15 @@ func (h *Hub) SendPrintJob(job *protocol.PrintJobRequest, printerID int64) error
 }
 
 // CancelPrintJob sends a cancel request to the client
-func (h *Hub) CancelPrintJob(jobID int64, computerID int64) error {
+func (h *Hub) CancelPrintJob(tenantID string, jobID int64, computerID int64) error {
 	h.mu.RLock()
-	client, ok := h.computerToClient[computerID]
+	var client *ClientConnection
+	if tenantClients, ok := h.tenantComputerToClient[tenantID]; ok {
+		client = tenantClients[computerID]
+	}
 	h.mu.RUnlock()
 
-	if !ok || client == nil {
+	if client == nil {
 		return &Error{Code: "computer_offline", Message: "Computer is not connected"}
 	}
 
@@ -267,24 +327,33 @@ func (h *Hub) sendError(client *ClientConnection, code, message string) {
 	})
 }
 
-// GetConnectedComputers returns IDs of all connected computers
-func (h *Hub) GetConnectedComputers() []int64 {
+// GetConnectedComputers returns IDs of all connected computers for a tenant
+func (h *Hub) GetConnectedComputers(tenantID string) []int64 {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	ids := make([]int64, 0, len(h.computerToClient))
-	for id := range h.computerToClient {
+	tenantClients, ok := h.tenantComputerToClient[tenantID]
+	if !ok {
+		return []int64{}
+	}
+
+	ids := make([]int64, 0, len(tenantClients))
+	for id := range tenantClients {
 		ids = append(ids, id)
 	}
 	return ids
 }
 
-// IsComputerConnected checks if a computer is currently connected
-func (h *Hub) IsComputerConnected(computerID int64) bool {
+// IsComputerConnected checks if a computer is currently connected for a tenant
+func (h *Hub) IsComputerConnected(tenantID string, computerID int64) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	_, ok := h.computerToClient[computerID]
-	return ok
+
+	if tenantClients, ok := h.tenantComputerToClient[tenantID]; ok {
+		_, connected := tenantClients[computerID]
+		return connected
+	}
+	return false
 }
 
 // Error represents a hub error

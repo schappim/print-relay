@@ -122,6 +122,7 @@ build_binaries() {
         "darwin:arm64"
         "linux:amd64"
         "linux:arm64"
+        "linux:arm"
     )
 
     local components=("server" "client")
@@ -370,8 +371,10 @@ build_deb_packages() {
 
     build_deb_package "server" "amd64" "amd64"
     build_deb_package "server" "arm64" "arm64"
+    build_deb_package "server" "arm" "armhf"
     build_deb_package "client" "amd64" "amd64"
     build_deb_package "client" "arm64" "arm64"
+    build_deb_package "client" "arm" "armhf"
 
     success "All .deb packages built"
 }
@@ -386,12 +389,20 @@ update_apt_metadata() {
 
     cd "$APT_PATH"
 
+    # Ensure all architecture directories exist
+    mkdir -p dists/stable/main/binary-amd64
+    mkdir -p dists/stable/main/binary-arm64
+    mkdir -p dists/stable/main/binary-armhf
+
     # Generate Packages files
     dpkg-scanpackages --arch amd64 pool/ > dists/stable/main/binary-amd64/Packages
     gzip -9c dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
 
     dpkg-scanpackages --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
     gzip -9c dists/stable/main/binary-arm64/Packages > dists/stable/main/binary-arm64/Packages.gz
+
+    dpkg-scanpackages --arch armhf pool/ > dists/stable/main/binary-armhf/Packages
+    gzip -9c dists/stable/main/binary-armhf/Packages > dists/stable/main/binary-armhf/Packages.gz
 
     # Generate Release file
     cd dists/stable
@@ -402,7 +413,7 @@ Label: PrintRelay
 Suite: stable
 Codename: stable
 Version: ${VERSION}
-Architectures: amd64 arm64
+Architectures: amd64 arm64 armhf
 Components: main
 Description: PrintRelay APT Repository
 Date: $(date -Ru)
