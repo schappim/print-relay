@@ -59,6 +59,19 @@ brew install printrelay-server
 brew install printrelay-client
 ```
 
+### Install via Script (macOS & Linux)
+
+```bash
+# Install both server and client
+curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash
+
+# Install only the client
+curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --client-only
+
+# Install only the server
+curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --server-only
+```
+
 ### Build from Source
 
 ```bash
