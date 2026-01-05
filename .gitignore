@@ -1,0 +1,28 @@
+# Binaries
+bin/
+printrelay-server
+printrelay-client
+printrelay-server-linux
+*.exe
+
+# Data directory
+data/
+*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log
+
+# Build output
+dist/
+build/
