@@ -72,6 +72,20 @@ curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh
 curl -sSL https://raw.githubusercontent.com/schappim/print-relay/main/install.sh | bash -s -- --server-only
 ```
 
+### Install via APT (Debian/Ubuntu)
+
+```bash
+# Add the GPG key
+curl -fsSL https://schappim.github.io/printrelay-apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/printrelay.gpg
+
+# Add the repository
+echo "deb [signed-by=/usr/share/keyrings/printrelay.gpg] https://schappim.github.io/printrelay-apt stable main" | sudo tee /etc/apt/sources.list.d/printrelay.list
+
+# Update and install
+sudo apt update
+sudo apt install printrelay-server printrelay-client
+```
+
 ### Build from Source
 
 ```bash
