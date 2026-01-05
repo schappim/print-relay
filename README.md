@@ -481,7 +481,9 @@ lp -d "Printer_Name" /path/to/test.pdf
 
 ## License
 
-MIT License
+Copyright (c) 2026, Ninja AI Labs Pty Ltd.
+
+This software is provided under a permissive license with an anti-SaaS competition clause. You may use, modify, and distribute this software freely, but you may not offer it as a competing hosted service. See [LICENSE](LICENSE) for full terms.
 
 ## Contributing
 
