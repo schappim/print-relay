@@ -102,6 +102,47 @@ go build -o printrelay-client ./cmd/client
 
 ---
 
+## SDKs & Client Libraries
+
+Official client libraries for integrating PrintRelay into your applications:
+
+### Ruby
+
+The [print_relay](https://github.com/schappim/print_relay_ruby) gem provides a modern, ergonomic Ruby interface for PrintRelay:
+
+```ruby
+gem 'print_relay'
+```
+
+```ruby
+require 'print_relay'
+
+# Configure for your PrintRelay server
+PrintRelay.configure do |config|
+  config.api_key = 'your-api-key'
+  config.use_print_relay!('https://your-server.com')
+end
+
+# Print a PDF from URL
+PrintRelay.print(
+  printer_id: 1,
+  url: 'https://example.com/invoice.pdf',
+  title: 'Invoice #123'
+)
+
+# Print a local file
+printer = PrintRelay::Printer.find(1)
+printer.print_file('/path/to/document.pdf', copies: 2)
+```
+
+Features:
+- Ergonomic printing from URLs, files, binary data, base64, or IO objects
+- Full API coverage (computers, printers, print jobs, scales, webhooks)
+- Also compatible with PrintNode cloud API
+- Zero runtime dependencies
+
+---
+
 ## Server Setup
 
 ### 1. Generate Authentication Keys
